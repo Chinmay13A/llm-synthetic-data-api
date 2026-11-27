@@ -1,6 +1,6 @@
-# DummyBackend (Generator Service)
+# LLM Synthetic Data API
 
-Spring Boot API that generates realistic dummy data from a JSON schema, backed by selectable LLM providers (OpenAI, Claude, Grok, Groq).
+Spring Boot REST API that generates realistic, schema-compliant test data from JSON Schema using LLMs, with runtime switching across OpenAI, Claude, Groq and Grok.
 
 ## Tech Stack
 
