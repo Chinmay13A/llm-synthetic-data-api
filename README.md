@@ -9,7 +9,7 @@ Spring Boot REST API that generates realistic, schema-compliant test data from J
 - **Maven**
 - **Lombok**
 - **LLM providers** via HTTP (`RestClient`) — OpenAI, Claude (Anthropic), Grok (xAI), Groq (free-tier, recommended for local testing)
-- **Bucket4j** — in-memory per-IP rate limiting on `POST /generate`
+- **Bucket4j + Redis (Lettuce)** — distributed per-IP and global rate limiting on `POST /generate`
 
 ## Project Structure
 
@@ -34,8 +34,12 @@ src/main/java/com/dummybackend/generatorservice/
 │   ├── GroqLlmProvider.java           # Groq (free tier)
 │   └── ChatCompletionsSupport.java    # Shared OpenAI-compatible helpers
 ├── ratelimit/
-│   ├── RateLimitProperties.java       # enabled + requests-per-minute
-│   ├── RateLimitService.java          # Per-IP Bucket4j buckets
+│   ├── RateLimitProperties.java       # Limits + Redis connection settings
+│   ├── RateLimitService.java          # Per-IP and global Bucket4j buckets
+│   ├── RateLimitDecision.java         # Allowed / rejected (client or global) + retry-after
+│   ├── BucketStore.java               # Where buckets live
+│   ├── RedisBucketStore.java          # Redis-backed store (lazy connect, auto-expiring keys)
+│   ├── RateLimiterUnavailableException.java
 │   └── RateLimitFilter.java           # OncePerRequestFilter on /generate
 ├── service/
 │   ├── GeneratorService.java          # Orchestrates prompt + LLM + parse
@@ -53,6 +57,7 @@ src/main/java/com/dummybackend/generatorservice/
 
 - JDK 17+
 - Maven 3.9+ (or use the included Maven Wrapper)
+- Redis 6+ on `localhost:6379` (or set `REDIS_URL`). Required for `POST /generate` while rate limiting is enabled.
 - API key(s) for the provider(s) you use:
   - `GROQ_API_KEY` (default provider; free tier, good for local testing)
   - `OPENAI_API_KEY`
@@ -78,6 +83,11 @@ Set in `src/main/resources/application.properties`, `.env`, or OS environment va
 | `server.port` | HTTP port | `8000` |
 | `rate-limit.enabled` | Enable per-IP rate limiting on `POST /generate` | `true` |
 | `rate-limit.requests-per-minute` | Max requests per IP per minute | `5` |
+| `rate-limit.requests-per-day` | Max requests per IP per day | `20` |
+| `rate-limit.global-burst` | Max requests at once across all clients; must not exceed the daily limit | `20` |
+| `rate-limit.global-requests-per-day` | Global refill rate, in requests per day across all clients | `200` |
+| `rate-limit.redis-url` | Redis connection URL (env `REDIS_URL`) | `redis://localhost:6379` |
+| `rate-limit.redis-timeout` | Connect and command timeout for Redis | `2s` |
 | `llm.default-provider` | Used when request omits `provider` | `groq` |
 | `llm.openai.*` | `base-url`, `api-key`, `model`, `max-tokens` | see `application.properties` |
 | `llm.claude.*` | same | … |
@@ -94,6 +104,18 @@ llm.grok.api-key=${GROK_API_KEY:}
 ```
 
 **Note:** `groq` (Groq) and `grok` (xAI) are different providers.
+
+## Redis
+
+Rate limits are stored in Redis, so they are shared across instances and survive restarts.
+
+Redis does not run natively on Windows. Options:
+
+- **WSL (Ubuntu):** `sudo apt install redis-server`, then `sudo service redis-server start`. Reachable from Windows at `localhost:6379`.
+- **Memurai:** Windows-native, Redis-compatible server.
+- **Docker:** `docker run -p 6379:6379 redis:7`
+
+Check it is running with `redis-cli ping` (expects `PONG`).
 
 ## Run
 
@@ -186,25 +208,46 @@ Content-Type: application/json
 
 ## Rate limiting
 
-`POST /generate` is limited **per client IP** (in-memory Bucket4j token bucket). `/health` is not limited.
+`POST /generate` is limited with Bucket4j token buckets stored in Redis. `/health` is not limited. Two limits are checked in order:
 
-- Client key: first hop of `X-Forwarded-For`, otherwise `RemoteAddr`
-- Buckets reset when the process restarts (single-instance MVP; not Redis/distributed)
+| Limit | Redis key | Default | Purpose |
+|---|---|---|---|
+| Per client | `rl:ip:{ip}` | 5 / minute and 20 / day | Fairness: no single IP can use up the shared quota |
+| Global | `rl:global` | Burst of 20, refilling 200 / day | Caps total LLM spend, however many IPs are used |
 
-When exceeded:
+A token bucket allows its full capacity at once, plus whatever refills afterwards. So the global bucket holds only `global-burst` tokens, and any 24 hours allows at most `global-burst + global-requests-per-day` requests (220 with the defaults). After a burst, roughly one request is allowed every 7 minutes until the bucket refills.
+
+- Client IP is the connection's remote address. A client-supplied `X-Forwarded-For` is ignored, so it cannot be used to reset the limit. If you deploy behind a reverse proxy, set `server.forward-headers-strategy=native` and configure the trusted proxy instead.
+- The per-client limit is checked first, so a client that is over its own limit does not use up the global quota.
+- Buckets refill gradually rather than resetting at fixed times, so there is no burst at the window boundary.
+- Keys expire on their own once a bucket would be full again.
+- Changing a limit only affects buckets created afterwards. To apply it immediately, delete the existing keys: `redis-cli --scan --pattern 'rl:*' | xargs redis-cli del`.
+
+When a limit is exceeded:
 
 - **Status:** `429 Too Many Requests`
-- **Header:** `Retry-After: 60`
+- **Header:** `Retry-After: <seconds until a token is available>`
 - **Body:**
 
 ```json
 {
   "message": "Rate limit exceeded",
-  "details": ["Too many requests. Limit is 5 requests per minute per IP."]
+  "details": ["Too many requests. Limits are 5 requests per minute and 20 requests per day per IP."]
 }
 ```
 
-Set `rate-limit.enabled=false` to disable locally.
+When the global limit is hit, the detail is `"The service has reached its overall request limit. Try again later."`
+
+**Fail-closed:** if Redis is unreachable, `POST /generate` returns `503 Service Unavailable` instead of calling the LLM without limits. The app still starts without Redis and reconnects automatically once Redis is back.
+
+```json
+{
+  "message": "Rate limiter unavailable",
+  "details": ["Requests are temporarily rejected because the rate limiter cannot be reached."]
+}
+```
+
+Set `rate-limit.enabled=false` to disable rate limiting locally (Redis is then not needed).
 
 ## Schema Format
 
@@ -270,8 +313,9 @@ All errors use:
 | Status | When |
 |---|---|
 | `400 Bad Request` | Invalid request body, schema, or unknown `provider` |
-| `429 Too Many Requests` | Per-IP rate limit exceeded on `POST /generate` |
+| `429 Too Many Requests` | Per-IP or global rate limit exceeded on `POST /generate` |
 | `502 Bad Gateway` | LLM call or parse failure |
+| `503 Service Unavailable` | Rate limiter (Redis) unreachable; request rejected without calling the LLM |
 
 ## Adding a new provider
 
